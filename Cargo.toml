@@ -1,0 +1,11 @@
+[package]
+name = "patchjmp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+goblin = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+iced-x86 = "1.21"
+asm-rs = { version = "0.1", features = ["x86_64"] }
