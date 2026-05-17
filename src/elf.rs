@@ -153,49 +153,39 @@ impl ElfFile {
         None
     }
 
-    /// Convert a BSS (SHT_NOBITS) section to SHT_PROGBITS with file-backed data.
-    /// Also updates the cached sh_offset and sh_size.
-    fn convert_bss_to_progbits(&mut self, sec_idx: usize, file_offset: u64, file_size: u64) {
-        let off = self.sh_offset + sec_idx * self.sh_entry_size;
-        // sh_type: offset 4, SHT_PROGBITS = 1
-        self.write_u32(off + 4, 1);
-        // sh_offset: offset 24
-        self.write_u64(off + 24, file_offset);
-        // sh_size: offset 32
-        self.write_u64(off + 32, file_size);
+    /// Find the PROGBITS section (.data) that contains the given VA.
+    fn find_data_section_by_va(&self, va: u64) -> Option<usize> {
+        for i in 0..self.sh_count {
+            let off = self.sh_offset + i * self.sh_entry_size;
+            if off + self.sh_entry_size > self.data.len() {
+                break;
+            }
+            let sh_type = u32::from_le_bytes(self.data[off + 4..off + 8].try_into().unwrap());
+            let sh_addr = u64::from_le_bytes(self.data[off + 16..off + 24].try_into().unwrap());
+            let sh_size = u64::from_le_bytes(self.data[off + 32..off + 40].try_into().unwrap());
+
+            // SHT_PROGBITS = 1
+            if sh_type == 1 && va >= sh_addr && va < sh_addr + sh_size {
+                return Some(i);
+            }
+        }
+        None
     }
 
-    /// Create a new SHT_NOBITS section after the last existing section.
-    /// Returns the new section index.
-    fn create_nobits_section(
-        &mut self,
-        name_offset: u32,
-        addr: u64,
-        size: u64,
-        flags: u64,
-    ) -> usize {
-        let new_idx = self.sh_count;
-        let entry_off = self.sh_offset + new_idx * self.sh_entry_size;
+    /// Expand a section's sh_size to cover a new end address.
+    fn expand_section_size(&mut self, sec_idx: usize, new_end_offset: u64) {
+        let off = self.sh_offset + sec_idx * self.sh_entry_size;
+        let sh_offset = u64::from_le_bytes(self.data[off + 24..off + 32].try_into().unwrap());
+        let new_size = new_end_offset.saturating_sub(sh_offset);
+        self.write_u64(off + 32, new_size);
+    }
 
-        // Zero out the entry
-        self.data[entry_off..entry_off + self.sh_entry_size].fill(0);
-
-        // sh_name: offset 0
-        self.write_u32(entry_off, name_offset);
-        // sh_type: offset 4, SHT_NOBITS = 8
-        self.write_u32(entry_off + 4, 8);
-        // sh_flags: offset 8
-        self.write_u64(entry_off + 8, flags);
-        // sh_addr: offset 16
-        self.write_u64(entry_off + 16, addr);
-        // sh_offset: offset 24 (0 for NOBITS)
-        self.write_u64(entry_off + 24, 0);
-        // sh_size: offset 32
-        self.write_u64(entry_off + 32, size);
-        // sh_link, sh_info, sh_addralign, sh_entsize: all 0
-
-        self.sh_count += 1;
-        new_idx
+    /// Update a section's sh_offset, sh_addr, and sh_size.
+    fn update_section(&mut self, sec_idx: usize, new_offset: u64, new_addr: u64, new_size: u64) {
+        let off = self.sh_offset + sec_idx * self.sh_entry_size;
+        self.write_u64(off + 16, new_addr);
+        self.write_u64(off + 24, new_offset);
+        self.write_u64(off + 32, new_size);
     }
 
     /// Shift everything after BSS (SHT + non-load sections) by `shift_amount` bytes.
@@ -330,13 +320,17 @@ impl ElfFile {
             self.data[zero_start..end].fill(0);
         }
 
-        // Convert BSS section to PROGBITS covering the entire new file-backed region
+        // Expand .data section's sh_size to cover the cave area
+        let data_file_end = cave_file_start + cave_size_padded;
+        if let Some(data_idx) = self.find_data_section_by_va(seg.p_vaddr + seg.p_filesz - 1) {
+            self.expand_section_size(data_idx, data_file_end);
+        }
+
+        // Update .bss section: sh_offset紧跟.data之后, sh_addr移到cave之后, sh_size保持原始BSS大小
         if let Some(bss_idx) = self.find_bss_section_in_segment(seg) {
-            self.convert_bss_to_progbits(bss_idx, bss_file_start, bss_offset + cave_size_padded);
-            if remaining_bss > 0 {
-                let remaining_bss_va = seg.p_vaddr + new_filesz;
-                self.create_nobits_section(0, remaining_bss_va, remaining_bss, 0x3);
-            }
+            let bss_offset_in_file = data_file_end;
+            let bss_new_addr = seg.p_vaddr + new_filesz;
+            self.update_section(bss_idx, bss_offset_in_file, bss_new_addr, bss_size);
         }
 
         Ok(cave_file_start)
