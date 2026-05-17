@@ -326,11 +326,11 @@ impl ElfFile {
             self.expand_section_size(data_idx, data_file_end);
         }
 
-        // Update .bss section: sh_offset紧跟.data之后, sh_addr移到cave之后, sh_size保持原始BSS大小
+        // Update .bss section: sh_offset紧跟.data之后, sh_addr移到cave之后, sh_size为剩余BSS大小
         if let Some(bss_idx) = self.find_bss_section_in_segment(seg) {
             let bss_offset_in_file = data_file_end;
             let bss_new_addr = seg.p_vaddr + new_filesz;
-            self.update_section(bss_idx, bss_offset_in_file, bss_new_addr, bss_size);
+            self.update_section(bss_idx, bss_offset_in_file, bss_new_addr, remaining_bss);
         }
 
         Ok(cave_file_start)
