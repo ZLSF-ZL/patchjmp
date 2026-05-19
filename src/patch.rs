@@ -4,10 +4,8 @@ use goblin::elf::program_header::{PF_W, PF_X};
 use crate::decode::decode_patch_site;
 use crate::elf::ElfFile;
 
-/// Minimum number of bytes to overwrite for a near JMP (5 bytes: E9 + rel32).
+/// Bytes to overwrite for a near JMP (5 bytes: E9 + rel32).
 const NEAR_JMP_SIZE: usize = 5;
-/// Size of an indirect JMP (14 bytes: FF 25 00 00 00 00 + 8-byte addr).
-const INDIRECT_JMP_SIZE: usize = 14;
 
 pub struct PatchConfig {
     /// Virtual address where the JMP will be placed.
@@ -37,28 +35,13 @@ pub struct PatchResult {
     pub overwritten_len: usize,
 }
 
-/// Encode an indirect JMP: FF 25 00 00 00 00 [8-byte absolute addr]
-fn encode_jmp_abs(_from: u64, to: u64) -> [u8; INDIRECT_JMP_SIZE] {
-    let mut buf = [0u8; INDIRECT_JMP_SIZE];
-    buf[0] = 0xFF;
-    buf[1] = 0x25;
-    buf[2..6].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    buf[6..14].copy_from_slice(&to.to_le_bytes());
-    buf
-}
-
-/// Try to encode a JMP from `from` to `to`.
-/// Uses rel32 (5 bytes) if possible, otherwise indirect (14 bytes).
-fn encode_jmp(from: u64, to: u64) -> Result<Vec<u8>> {
-    let offset = to as i64 - (from as i64 + NEAR_JMP_SIZE as i64);
-    if let Ok(offset_i32) = i32::try_from(offset) {
-        let mut buf = [0u8; NEAR_JMP_SIZE];
-        buf[0] = 0xE9;
-        buf[1..5].copy_from_slice(&offset_i32.to_le_bytes());
-        Ok(buf.to_vec())
-    } else {
-        Ok(encode_jmp_abs(from, to).to_vec())
-    }
+/// Encode a near JMP (E9 + rel32) from `from` to `to`.
+fn encode_jmp(from: u64, to: u64) -> Vec<u8> {
+    let offset = (to as i64 - (from as i64 + NEAR_JMP_SIZE as i64)) as i32;
+    let mut buf = [0u8; NEAR_JMP_SIZE];
+    buf[0] = 0xE9;
+    buf[1..5].copy_from_slice(&offset.to_le_bytes());
+    buf.to_vec()
 }
 
 /// Apply the patch to the ELF binary.
@@ -106,14 +89,10 @@ pub fn apply_patch(elf: &mut ElfFile, config: &PatchConfig) -> Result<PatchResul
         );
     }
 
-    // 3. Determine JMP encoding (try near first, fall back to indirect)
-    let test_jmp = encode_jmp(*patch_addr, *patch_addr)?;
-    let jmp_size = test_jmp.len();
-
-    // 4. Decode instructions at the patch site — find complete instruction boundaries
+    // 3. Decode instructions at the patch site — find complete instruction boundaries
     let patch_file_offset = elf.va_to_offset(*patch_addr)? as usize;
     let code_region = &elf.data[patch_file_offset..];
-    let decoded = decode_patch_site(code_region, *patch_addr, jmp_size)
+    let decoded = decode_patch_site(code_region, *patch_addr, NEAR_JMP_SIZE)
         .context("decoding instructions at patch site")?;
 
     let overwrite_len = decoded.total_len;
@@ -137,19 +116,19 @@ pub fn apply_patch(elf: &mut ElfFile, config: &PatchConfig) -> Result<PatchResul
         }
     }
 
-    // 5. Calculate cave size: payload + JMP back, 8-byte aligned, minimum 8
+    // 4. Calculate cave size: payload + JMP back, 8-byte aligned, minimum 8
     let cave_total_size = crate::elf::align_up(payload.len() as u64 + NEAR_JMP_SIZE as u64, 8).max(8);
 
-    // 6. Extend the cave segment (cave placed at BSS file offset + bss_offset)
+    // 5. Extend the cave segment (cave placed at BSS file offset + bss_offset)
     let cave_file_offset = elf.extend_segment_for_cave(&cave_seg, cave_total_size, *bss_offset)?;
 
     let cave_va_calc = cave_seg.p_vaddr + (cave_file_offset - cave_seg.p_offset);
 
-    // 7. Ensure file is large enough before writing
+    // 6. Ensure file is large enough before writing
     elf.ensure_file_size();
 
-    // 8. Write JMP at patch location
-    let jmp_to_cave = encode_jmp(*patch_addr, cave_va_calc)?;
+    // 7. Write JMP at patch location
+    let jmp_to_cave = encode_jmp(*patch_addr, cave_va_calc);
 
     for (i, &byte) in jmp_to_cave.iter().enumerate() {
         elf.data[patch_file_offset + i] = byte;
@@ -159,10 +138,10 @@ pub fn apply_patch(elf: &mut ElfFile, config: &PatchConfig) -> Result<PatchResul
         println!("[*] JMP written at 0x{:x}: {:02x?}", patch_addr, jmp_to_cave);
     }
 
-    // 9. Build cave content: payload + JMP back + NOP padding
+    // 8. Build cave content: payload + JMP back + NOP padding
     let original_code_addr = *patch_addr + overwrite_len as u64;
     let jmp_back_addr = cave_va_calc + payload.len() as u64;
-    let jmp_back = encode_jmp(jmp_back_addr, original_code_addr)?;
+    let jmp_back = encode_jmp(jmp_back_addr, original_code_addr);
 
     let mut cave_data = Vec::new();
     cave_data.extend_from_slice(payload);

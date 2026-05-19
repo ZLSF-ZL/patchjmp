@@ -79,7 +79,6 @@ fn relocate_code(code: &[u8], orig_base: u64, new_base: u64) -> Result<Vec<u8>> 
 
         // Fix RIP-relative memory operands
         if fixed.is_ip_rel_memory_operand() {
-            // new_disp = old_disp + (old_ip - new_ip)
             let corr = fixed.ip() as i64 - new_ip as i64;
             let d = fixed.memory_displacement64() as i64 + corr;
             fixed.set_memory_displacement64(d as u64);
@@ -87,23 +86,21 @@ fn relocate_code(code: &[u8], orig_base: u64, new_base: u64) -> Result<Vec<u8>> 
 
         // Fix relative branches and calls
         match fixed.flow_control() {
-            FlowControl::ConditionalBranch => {
+            FlowControl::ConditionalBranch => { // Conditional jump branch out of range, need to convert to opposite + near or absolute jump
                 let target = fixed.near_branch_target();
-                let _old_next_ip = fixed.ip() as i64 + fixed.len() as i64;
                 let new_offset = target as i64 - (new_ip as i64 + fixed.len() as i64);
                 let abs_target = (new_ip as i64 + fixed.len() as i64 + new_offset) as u64;
                 if i8::try_from(new_offset).is_ok() {
                     let code_byte = 0x70u16 + (fixed.code() as u16 & 0x0F);
                     fixed = Instruction::with_branch(unsafe { std::mem::transmute(code_byte) }, abs_target)?;
-                } else if let Ok(rel32) = i32::try_from(new_offset) {
-                    let _ = rel32;
+                } else if let Ok(_) = i32::try_from(new_offset) {
                     let code_byte = 0x0F80u16 + (fixed.code() as u16 & 0x0F);
                     fixed = Instruction::with_branch(unsafe { std::mem::transmute(code_byte) }, abs_target)?;
                 } else {
                     bail!("conditional branch cannot reach target after relocation");
                 }
             }
-            FlowControl::UnconditionalBranch => {
+            FlowControl::UnconditionalBranch => { // Unconditional jump branch out of range, need to convert to absolute jump
                 let target = fixed.near_branch_target();
                 let new_offset = target as i64 - (new_ip as i64 + fixed.len() as i64);
                 let abs_target = (new_ip as i64 + fixed.len() as i64 + new_offset) as u64;
@@ -117,12 +114,10 @@ fn relocate_code(code: &[u8], orig_base: u64, new_base: u64) -> Result<Vec<u8>> 
                     fixed = Instruction::with_branch(iced_x86::Code::Jmp_rel32_64, abs_target)?;
                 }
             }
-            FlowControl::Call => {
+            FlowControl::Call => { // Call branch out of range, need to convert to absolute indirect call via RIP-relative memory operand
                 if fixed.code() == iced_x86::Code::Call_rel32_64 {
                     let target = fixed.near_branch_target();
-                    let new_offset = target as i64 - (new_ip as i64 + fixed.len() as i64);
-                    let abs_target = (new_ip as i64 + fixed.len() as i64 + new_offset) as u64;
-                    fixed = Instruction::with_branch(iced_x86::Code::Call_rel32_64, abs_target)?;
+                    fixed = Instruction::with_branch(iced_x86::Code::Call_rel32_64, target)?;
                 }
             }
             _ => {}
@@ -133,14 +128,6 @@ fn relocate_code(code: &[u8], orig_base: u64, new_base: u64) -> Result<Vec<u8>> 
             bail!("failed to re-encode instruction at 0x{:x}: {}", fixed.ip(), e);
         }
         new_code.extend_from_slice(&encoder.take_buffer());
-    }
-
-    if new_code.len() != code.len() {
-        bail!(
-            "relocation produced {} bytes but original was {} bytes",
-            new_code.len(),
-            code.len()
-        );
     }
 
     Ok(new_code)
