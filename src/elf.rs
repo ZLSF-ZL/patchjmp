@@ -235,12 +235,30 @@ impl ElfFile {
             self.data.resize(needed, 0);
         }
 
-        // New positions: SHT first, then non-load sections
+        // Detect original ordering: are non-load sections before or after SHT?
+        let nonload_before_sht = nonload_sections.iter()
+            .map(|&(_, off, _)| off)
+            .min()
+            .map(|min_off| min_off < old_sht_start as u64)
+            .unwrap_or(false);
+
+        // New positions: shift both blocks, preserve original ordering
         let new_sht_start = self.sh_offset as u64 + shift_amount;
-        let new_nonload_start = align_up(new_sht_start + sht_size as u64, 8);
+        let (new_sht_pos, new_nonload_pos) = if nonload_before_sht {
+            // Original: [non-load] [SHT] -> maintain same order
+            let nonload_total: u64 = nonload_data.iter().map(|(_, d)| align_up(d.len() as u64, 8)).sum();
+            let new_nonload_start = new_sht_start;
+            let new_sht_after = align_up(new_nonload_start + nonload_total, 8);
+            (new_sht_after, new_nonload_start)
+        } else {
+            // Original: [SHT] [non-load] -> maintain same order
+            let new_sht_start_val = new_sht_start;
+            let new_nonload_start = align_up(new_sht_start_val + sht_size as u64, 8);
+            (new_sht_start_val, new_nonload_start)
+        };
 
         // Update sh_offset in SHT for each non-load section
-        let mut current = new_nonload_start;
+        let mut current = new_nonload_pos;
         for &(idx, ref bytes) in &nonload_data {
             let entry_off = idx * self.sh_entry_size;
             let off_field = entry_off + 24;
@@ -260,21 +278,34 @@ impl ElfFile {
             self.data[old_sht_start..old_sht_end].fill(0);
         }
 
-        // Write non-load sections to new positions
-        current = new_nonload_start;
-        for (_, bytes) in &nonload_data {
-            let start = current as usize;
-            self.data[start..start + bytes.len()].copy_from_slice(bytes);
-            current = align_up(current + bytes.len() as u64, 8);
+        // Write blocks in original order
+        if nonload_before_sht {
+            // Write non-load sections first
+            current = new_nonload_pos;
+            for (_, bytes) in &nonload_data {
+                let start = current as usize;
+                self.data[start..start + bytes.len()].copy_from_slice(bytes);
+                current = align_up(current + bytes.len() as u64, 8);
+            }
+            // Write SHT after
+            let new_sht_usize = new_sht_pos as usize;
+            self.data[new_sht_usize..new_sht_usize + sht_data.len()].copy_from_slice(&sht_data);
+        } else {
+            // Write SHT first
+            let new_sht_usize = new_sht_pos as usize;
+            self.data[new_sht_usize..new_sht_usize + sht_data.len()].copy_from_slice(&sht_data);
+            // Write non-load sections after
+            current = new_nonload_pos;
+            for (_, bytes) in &nonload_data {
+                let start = current as usize;
+                self.data[start..start + bytes.len()].copy_from_slice(bytes);
+                current = align_up(current + bytes.len() as u64, 8);
+            }
         }
 
-        // Write SHT to new position
-        let new_sht_usize = new_sht_start as usize;
-        self.data[new_sht_usize..new_sht_usize + sht_data.len()].copy_from_slice(&sht_data);
-
         // Update e_shoff in ELF header (offset 40)
-        self.write_u64(40, new_sht_start);
-        self.sh_offset = new_sht_start as usize;
+        self.write_u64(40, new_sht_pos);
+        self.sh_offset = new_sht_pos as usize;
 
         Ok(())
     }
@@ -361,46 +392,27 @@ impl ElfFile {
 
         let dynsyms: Vec<_> = elf.dynsyms.iter().collect();
 
-        let mut all_stubs: Vec<u64> = Vec::new();
-        for sh in &elf.section_headers {
-            let name = elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
-            if !name.contains("plt") {
-                continue;
-            }
-            let va = sh.sh_addr;
-            let size = sh.sh_size as usize;
-            let file_off = sh.sh_offset as usize;
-            if size == 0 || file_off + size > self.data.len() {
-                continue;
-            }
-            let data = &self.data[file_off..file_off + size];
-            let mut i = 0;
-            while i + 9 < data.len() {
-                if data[i] == 0xF3
-                    && data[i + 1] == 0x0F
-                    && data[i + 2] == 0x1E
-                    && data[i + 3] == 0xFA
-                    && data[i + 4] == 0xFF
-                    && data[i + 5] == 0x25
-                {
-                    all_stubs.push(va + i as u64);
-                    i += 16;
-                } else {
-                    i += 1;
-                }
-            }
-        }
+        // Find .plt.sec section (contains the actual PLT stubs, each 16 bytes)
+        let plt_sec = elf.section_headers.iter().find(|sh| {
+            elf.shdr_strtab.get_at(sh.sh_name).unwrap_or("") == ".plt.sec"
+        });
 
-        for (i, rel) in elf.pltrelocs.iter().enumerate() {
-            if i >= all_stubs.len() {
-                break;
-            }
-            let sym_idx = rel.r_sym as usize;
-            if sym_idx < dynsyms.len() {
-                let sym = &dynsyms[sym_idx];
-                if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                    if !name.is_empty() {
-                        result.insert(name.to_string(), all_stubs[i]);
+        if let Some(sec) = plt_sec {
+            let stub_size: u64 = 16;
+            let stub_count = sec.sh_size / stub_size;
+
+            for (i, rel) in elf.pltrelocs.iter().enumerate() {
+                if i as u64 >= stub_count {
+                    break;
+                }
+                let sym_idx = rel.r_sym as usize;
+                if sym_idx < dynsyms.len() {
+                    let sym = &dynsyms[sym_idx];
+                    if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                        if !name.is_empty() {
+                            let stub_addr = sec.sh_addr + i as u64 * stub_size;
+                            result.insert(name.to_string(), stub_addr);
+                        }
                     }
                 }
             }
