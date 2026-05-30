@@ -247,9 +247,8 @@ impl ElfFile {
         let (new_sht_pos, new_nonload_pos) = if nonload_before_sht {
             // Original: [non-load] [SHT] -> maintain same order
             let nonload_total: u64 = nonload_data.iter().map(|(_, d)| align_up(d.len() as u64, 8)).sum();
-            let new_nonload_start = new_sht_start;
-            let new_sht_after = align_up(new_nonload_start + nonload_total, 8);
-            (new_sht_after, new_nonload_start)
+            let new_nonload_start = new_sht_start - nonload_total;
+            (new_sht_start, new_nonload_start)
         } else {
             // Original: [SHT] [non-load] -> maintain same order
             let new_sht_start_val = new_sht_start;
@@ -339,7 +338,7 @@ impl ElfFile {
 
         // Update segment: p_filesz grows by bss_offset + cave_size_padded
         let new_filesz = seg.p_filesz + bss_offset + cave_size_padded;
-        let remaining_bss = bss_size.saturating_sub(bss_offset + cave_size_padded);
+        let remaining_bss = bss_size.saturating_sub(bss_offset + cave_size_padded).max(8);
         let new_memsz = new_filesz + remaining_bss;
         self.update_segment(seg, None, Some(new_filesz), Some(new_memsz))?;
 

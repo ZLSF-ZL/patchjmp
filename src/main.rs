@@ -203,11 +203,22 @@ fn main() -> Result<()> {
     let raw_payload = parse_payload(&cli.patch, 0, &plt_symbols)?;
 
     // Step 2: Find cave segment and pre-calculate cave VA
-    let (cave_vaddr, cave_filesz) = {
+    let (cave_vaddr, cave_filesz, cave_seg_memsz) = {
         let cave_seg = elf.segments.iter().rev()
             .find(|s| s.p_flags & PF_W != 0)
             .context("no writable PT_LOAD segment for code cave")?;
-        (cave_seg.p_vaddr, cave_seg.p_filesz)
+        (cave_seg.p_vaddr, cave_seg.p_filesz, cave_seg.p_memsz)
+    };
+
+    // Auto-calculate bss_offset if not specified: skip the entire BSS region
+    let bss_offset = if bss_offset == 0 {
+        let auto = cave_seg_memsz - cave_filesz;
+        if cli.verbose {
+            println!("[*] Auto bss_offset: 0x{:x} (BSS size)", auto);
+        }
+        auto
+    } else {
+        bss_offset
     };
 
     let cave_va = cave_vaddr + cave_filesz + bss_offset;
