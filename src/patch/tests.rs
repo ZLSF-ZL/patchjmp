@@ -1,4 +1,4 @@
-use super::*;
+use super::{PatchPlan, jmp::encode_jmp, site::decode_sites};
 use crate::elf::{ElfFile, synthetic_elf};
 
 #[test]
@@ -22,13 +22,6 @@ fn rejects_out_of_range_jmp() {
 }
 
 #[test]
-fn slot_sizes_are_16_byte_aligned() {
-    assert_eq!(slot_size(0).unwrap(), 16);
-    assert_eq!(slot_size(11).unwrap(), 16);
-    assert_eq!(slot_size(12).unwrap(), 32);
-}
-
-#[test]
 fn rejects_patch_into_non_executable_segment() {
     let elf = ElfFile::parse(synthetic_elf()).unwrap();
     // 0x0..0x400 is the read-only PT_LOAD covering the headers.
@@ -45,48 +38,64 @@ fn rejects_overlapping_sites() {
 }
 
 #[test]
-fn assembles_multiple_payloads_at_distinct_slots() {
-    let sources = vec!["nop".to_string(), "nop; nop".to_string()];
-    let payloads = assemble_in_cave(0x10000, &sources, |_, src, va| {
-        let mut out = Vec::new();
-        // encode the base address so the test can see which slot was used
-        out.extend_from_slice(&(va as u32).to_le_bytes());
-        out.extend_from_slice(src.as_bytes());
-        Ok(out)
+fn assembles_once_at_final_slot_addresses() {
+    let elf = ElfFile::parse(synthetic_elf()).unwrap();
+    let sites = [0x401000, 0x401010, 0x401020];
+    let sources = ["12".into(), "11".into(), "0".into()];
+    let mut assembled_at = Vec::new();
+    let plan = PatchPlan::prepare(&elf, &sites, &sources, |source, va| {
+        assembled_at.push(va);
+        Ok(vec![0x90; source.parse()?])
     })
     .unwrap();
-    assert_eq!(payloads.len(), 2);
-    let s0 = payloads[0].len();
-    let expect_second = 0x10000u64 + slot_size(s0).unwrap();
-    assert_eq!(
-        u32::from_le_bytes(payloads[1][..4].try_into().unwrap()) as u64,
-        expect_second
-    );
+
+    let base = plan.segment().cave_va;
+    assert_eq!(assembled_at, [base, base + 32, base + 48]);
+    let sizes: Vec<_> = plan.patches().iter().map(|p| p.slot_size()).collect();
+    assert_eq!(sizes, [32, 16, 16]);
+}
+
+#[test]
+fn rejects_out_of_range_jump_during_planning() {
+    let mut elf = ElfFile::parse(synthetic_elf()).unwrap();
+    // Push the new segment beyond rel32 reach without growing the fixture file.
+    elf.segments[1].p_memsz = 1 << 32;
+    let err = PatchPlan::prepare(&elf, &[0x401000], &["nop".into()], |_, _| Ok(vec![0x90]))
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("out of rel32 range"));
 }
 
 #[test]
 fn applies_two_patches_into_a_single_segment() {
     let mut elf = ElfFile::parse(synthetic_elf()).unwrap();
-    let plan = elf.plan_patch_segment().unwrap();
-    let sites = decode_sites(&elf, &[0x401000, 0x401010]).unwrap();
-    assert_eq!(sites.len(), 2);
-    assert_eq!(sites[0].overwrite_len, 5);
+    // A seven-byte instruction must be skipped whole, even though the JMP uses five bytes.
+    elf.write_bytes(0x1000..0x1007, &[0x48, 0x8d, 0x05, 0, 0, 0, 0])
+        .unwrap();
+    let plan = PatchPlan::prepare(
+        &elf,
+        &[0x401000, 0x401010],
+        &["6".into(), "20".into()],
+        |source, _| Ok(vec![0x90; source.parse()?]),
+    )
+    .unwrap();
+    let segment = plan.apply(&mut elf).unwrap();
 
-    let payloads = vec![vec![0x90u8; 6], vec![0x90u8; 20]];
-    let result = apply_patches(&mut elf, &plan, &sites, &payloads).unwrap();
-
-    assert_eq!(result.patches.len(), 2);
-    assert_eq!(result.segment_vaddr, plan.vaddr);
-    // both payloads live in the one new segment
-    for p in &result.patches {
-        assert!(p.cave_va >= plan.vaddr);
-        assert!(p.cave_va + p.cave_size <= plan.vaddr + result.segment_size);
-        assert_eq!(p.jmp_bytes[0], 0xe9);
+    assert_eq!(plan.patches().len(), 2);
+    assert_eq!(segment.p_vaddr, plan.segment().vaddr);
+    for (p, resume_va) in plan.patches().iter().zip([0x401007, 0x401015]) {
+        assert!(p.cave_va >= segment.p_vaddr);
+        assert!(p.cave_va + p.slot_size() as u64 <= segment.p_vaddr + segment.p_memsz);
+        let site = p.site.file_offset as usize;
+        assert_eq!(elf.bytes(site..site + p.jmp.len()).unwrap(), p.jmp);
+        let start = p.cave_offset as usize;
+        let slot = elf.bytes(start..start + p.slot_size()).unwrap();
+        let (payload, rest) = slot.split_at(p.payload().len());
+        assert_eq!(payload, p.payload());
+        let back = encode_jmp(p.cave_va + payload.len() as u64, resume_va).unwrap();
+        assert_eq!(&rest[..back.len()], &back);
+        assert!(rest[back.len()..].iter().all(|&b| b == 0x90));
     }
-    // distinct, non-overlapping slots
-    assert!(result.patches[0].cave_va < result.patches[1].cave_va);
-
-    let image = elf.bytes(0..elf.len()).unwrap().to_vec();
-    let reparsed = ElfFile::parse(image).unwrap();
+    let reparsed = ElfFile::parse(elf.as_bytes().to_vec()).unwrap();
     assert_eq!(reparsed.segments.len(), 3);
 }

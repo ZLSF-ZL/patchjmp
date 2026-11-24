@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use asm_rs::Arch;
 
 /// Parse a `--patch` value into final-position machine code.
@@ -18,25 +18,15 @@ pub fn parse_payload(
         return parse_hex_bytes(trimmed);
     }
 
-    let labels = plt_labels(plt_symbols);
-    let label_refs: Vec<(&str, u64)> = labels
-        .iter()
-        .map(|(name, addr)| (name.as_str(), *addr))
-        .collect();
-
     let mut asm = asm_rs::Assembler::new(Arch::X86_64);
     asm.base_address(base_addr);
-    for &(name, addr) in &label_refs {
-        asm.define_external(name, addr);
+    for (name, addr) in plt_labels(plt_symbols) {
+        asm.define_external(&name, addr);
     }
-    asm.emit(trimmed)
-        .map_err(|e| anyhow::anyhow!("assembly error: {}", e))
-        .context(format!("assembling: {}", trimmed))?;
-    let result = asm
-        .finish()
-        .map_err(|e| anyhow::anyhow!("assembly error: {}", e))
-        .context(format!("assembling: {}", trimmed))?;
-    Ok(result.into_bytes())
+    let assembly_error =
+        |e| anyhow!("assembly error: {e}").context(format!("assembling: {trimmed}"));
+    asm.emit(trimmed).map_err(assembly_error)?;
+    Ok(asm.finish().map_err(assembly_error)?.into_bytes())
 }
 
 /// `0x`-prefixed or bare even-length hex digit string.

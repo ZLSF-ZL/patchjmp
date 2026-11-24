@@ -4,16 +4,16 @@ ELF64 x86-64 二进制补丁工具 —— 通过新增独立可执行段注入�
 
 ## 简介
 
-patchjmp 是一个纯 Rust 实现的 ELF64 x86-64 二进制补丁工具。它**不修改任何原有段**：在文件末尾追加一个专用的 `PT_LOAD` 段（R-X），把用户代码放进去，再在目标地址插入一条 JMP 跳转过去。
+patchjmp 是一个 Rust 实现的 ELF64 x86-64 二进制补丁工具。它保留原有 `PT_LOAD` 段的映射属性，在文件末尾追加一个专用的 `PT_LOAD` 段（R-X）存放用户代码，再在原可执行段的目标地址写入 JMP 跳转过去。为容纳新增 program header，工具会迁移 program header table；若存在 `PT_PHDR`，也会更新该表项。
 
 整个过程无需重新编译目标程序，原有段的 `p_flags`、`.data`、`.bss` 全部保持原样，生成的 ELF 结构完整、section header 正确，可直接在 IDA Pro 等工具中分析。
 
 ### 工作原理
 
 1. **指令边界解码** —— 使用 `iced-x86` 在目标地址逐条解码，自动找到完整指令边界，确保不截断相邻指令
-2. **追加独立段** —— 在文件末尾（页对齐）追加一个 `PT_LOAD`，权限固定为 `R-X`，VA 取所有现有 `PT_LOAD` 之后的第一个空闲页
-3. **迁移 program header table** —— 新段开头放一份**扩容后的 PHT**（多出新的 `PT_LOAD` 项），`e_phoff` 指向它；`PT_PHDR` 同步重定位。原有段的表项逐字节保持不变
-4. **构建 payload** —— 段内布局为 `PHT + 若干个 16 字节对齐的 slot`，每个 slot = `payload + JMP 回原地址 + NOP 填充`；多补丁共用同一个新段，各 payload 依次排列（因 payload 字节数可能取决于其最终 VA，布局会迭代到不动点）
+2. **追加独立段** —— 在现有文件和 `PT_LOAD` 映射范围之后选择同一个页对齐值，作为新增 `R-X` 段的文件偏移和 VA
+3. **迁移 program header table** —— 新段开头放一份**扩容后的 PHT**（多出新的 `PT_LOAD` 项），`e_phoff` 指向它；若有 `PT_PHDR` 则同步重定位。原有 `PT_LOAD` 表项保持不变
+4. **构建 payload** —— 段内布局为 `PHT + 若干个 16 字节对齐的 slot`，每个 slot = `payload + JMP 回原地址 + NOP 填充`。每个 slot 的起始地址只取决于此前 slot 的大小，因此按顺序在最终地址上汇编一次即可
 5. **追加 `.patch` 节** —— section header table 扩容并整体迁移到新段之后，`.shstrtab` 重建并追加 `.patch` 名称，原节（含 `.bss` 的 `SHT_NOBITS` 语义）不变
 
 ```
@@ -36,13 +36,13 @@ patchjmp 是一个纯 Rust 实现的 ELF64 x86-64 二进制补丁工具。它**�
 ## 核心功能
 
 ### 代码注入
-- 在 ELF x64 可执行文件的任意可执行地址注入自定义代码
+- 在 ELF64 x86-64 文件中，向有文件内容的可执行 `PT_LOAD` 地址注入自定义代码
 - 支持两种输入格式（自动检测）：
   - **x64 汇编**：`xor rax,rax; mov eax,60; syscall`
   - **hex 字节**：`4831c0b83c0000000f05`
 - PLT 符号自动解析（`.plt.sec` 优先，回退到 `.plt`），汇编中可直接引用外部函数（如 `call _puts`）
 - **多补丁**：重复 `--at` / `--patch`，第 N 个 `--at` 与第 N 个 `--patch` 一一对应，所有 payload 共用一个新增的 R-X 段（而非每个补丁各加一段）
-- **`--dry-run`**：只做全部校验与布局计算并打印将要发生的改动，不写任何文件
+- **`--dry-run`**：检查补丁点、布局和跳转范围，打印补丁计划，但不重写 ELF 或输出文件
 
 ### 指令边界检测
 - 逐条解码目标地址的指令，自动找到完整边界
@@ -56,7 +56,7 @@ patchjmp 是一个纯 Rust 实现的 ELF64 x86-64 二进制补丁工具。它**�
 - 新增段固定 `R-X`，只承载代码
 
 ### ELF 结构完整性
-- program header table 迁移到新段内并扩容，`PT_PHDR` 重定位
+- program header table 迁移到新段内并扩容，`PT_PHDR`（若存在）重定位
 - section header table 迁移到文件末尾并扩容，`e_shoff` / `e_shnum` 同步更新
 - 新增 `.patch` 节（`SHT_PROGBITS`，`SHF_ALLOC | SHF_EXECINSTR`），`sh_addr` 与段内 VA 一致
 - `.shstrtab` 重建并保留全部原有节名
@@ -88,7 +88,7 @@ patchjmp <input> --at <addr> --patch <code> [options]
 | `--at <hex>` | 插入 JMP 的目标虚拟地址；**可重复**，第 N 个 `--at` 与第 N 个 `--patch` 一一对应 |
 | `--patch <code>` | 补丁代码：x64 汇编或 hex 字节（自动检测）；可重复以打多个补丁 |
 | `--output <path>` | 输出文件路径（默认：`<input>.patched`） |
-| `--dry-run` | 只做全部校验与布局计算并打印将要发生的改动，**不写任何文件** |
+| `--dry-run` | 完成 payload 解析/汇编与补丁规划（含跳转范围检查），**不写任何文件** |
 | `-v, --verbose` | 输出详细信息 |
 
 ### 示例
@@ -154,7 +154,7 @@ patchjmp ./binary \
 ```
 
 加 `-v` 后还会逐条列出每个补丁点被覆盖的指令及其原始字节、汇编出的 payload 字节；
-`--dry-run` 输出：
+`--dry-run` 会先完成 payload 解析/汇编和补丁计划（包括跳转范围检查），但不会安装段、改写 ELF 或写输出文件。其输出示例：
 
 ```
 === Dry Run (nothing written) ===
@@ -168,7 +168,7 @@ patchjmp ./binary \
 
 - 仅支持 ELF64 x86-64 格式
 - 目标地址必须位于可执行的 `PT_LOAD` 段内，且是文件背书的区间（不能落在 `.bss` 之类无文件字节的尾部）
-- JMP 使用 5 字节 `E9 rel32`；新段 VA 紧邻现有映射，正常情况下必然在 ±2GB 内，超范围会显式报错而不是静默截断
+- JMP 使用 5 字节 `E9 rel32`；补丁入口到 payload、payload 到恢复地址的跳转都会检查 `rel32` 范围，超范围时拒绝生成
 - 工具不会自动恢复被覆盖的原始指令；如需保留原始逻辑，用户需在 payload 中手动处理，末尾会自动跳回被覆盖区域之后
 - 不支持 `PN_XNUM` / `SHN_XINDEX` 扩展计数形式
 - 多补丁时，各补丁点不能重叠（包含各自被覆盖的完整指令范围），否则会报错
@@ -188,7 +188,8 @@ patchjmp ./binary \
 
 ```
 src/
-├── main.rs    # CLI 入口、verbose/摘要输出
+├── main.rs    # CLI 参数与执行流程
+├── report.rs  # verbose、dry-run 和结果摘要
 ├── payload.rs # --patch 解析（hex / 汇编），按最终地址汇编
 ├── decode.rs  # 目标地址指令边界解码
 ├── elf/       # ELF 结构层
@@ -197,16 +198,14 @@ src/
 │   ├── install.rs # install_patch_segment、PHT/SHT/.shstrtab 写入
 │   └── plt.rs     # resolve_plt_symbols
 └── patch/     # 补丁语义层
-    ├── mod.rs     # PatchOutcome / PatchResult、对外重导出
+    ├── mod.rs     # 导出 PatchPlan
     ├── jmp.rs     # encode_jmp（E9 rel32）、NEAR_JMP_SIZE
     ├── site.rs    # 补丁点解码、PF_X 校验、重叠检测
-    ├── layout.rs  # slot 布局与不动点迭代（assemble_in_cave）
-    └── apply.rs   # install 新段 + 写入 payload/双向 JMP
+    └── plan.rs    # 计算 slot、汇编并编码跳转；应用同一份计划
 ```
 
-各层职责：`main` 只做参数解析与展示，`payload` 负责用户代码到机器码，
-`patch` 负责补丁语义（接收 `main` 预算好的段布局，不再自行推导；内部再按 jmp/site/layout/apply 分层），
-`elf` 负责 ELF 结构读写并通过受检的 `bytes` / `write_bytes` 对外提供访问。
+`main` 串起执行流程，`payload` 将用户代码转为机器码，`elf` 负责 ELF 结构读写。
+`patch` 在不改动 ELF 的情况下生成一份 `PatchPlan`；`report` 和实际写入都使用这份计划，不再各自计算 slot。
 
 ## 测试
 
@@ -218,10 +217,10 @@ cargo clippy --all-targets -- -D warnings
 单元测试使用程序内构造的最小 ELF，不依赖外部样本，覆盖：
 
 - ELF 解析、补丁段规划/安装、PHT/SHT 迁移
-- 原有 `PT_LOAD` 不被修改（逐字节比对）、`AT_PHDR` 不变量
+- 原有 `PT_LOAD` 表项不被修改（逐字节比对）、`PT_PHDR`/`AT_PHDR` 布局不变量
 - 指令边界解码、JMP 编码边界与超范围拒绝
 - 补丁点重叠拒绝、非可执行段拒绝
-- 多 payload 的 slot 布局与不动点迭代、多补丁共用单一新段
+- 多 payload 在最终地址依次汇编、规划阶段拒绝超距跳转、多补丁共用单一新段
 
 ### 真实运行验证
 

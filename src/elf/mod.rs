@@ -188,9 +188,9 @@ impl ElfFile {
         seg.p_vaddr.saturating_add(seg.p_memsz)
     }
 
-    /// Total size of the in-memory ELF image in bytes.
-    pub fn len(&self) -> usize {
-        self.data.len()
+    #[cfg(test)]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
     }
 
     /// Borrow a checked byte range of the underlying image.
